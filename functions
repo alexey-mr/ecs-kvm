@@ -1,0 +1,233 @@
+#!/bin/bash
+
+function get_volume_pool_path {
+  local pool=$1
+  local pool_path=$(virsh pool-dumpxml $pool | sed -n '/path/{s/.*<path>\(.*\)<\/path>.*/\1/;p}')
+  echo $pool_path
+}
+
+function create_volume_pool() {
+  local pool=$1
+  if ! virsh pool-info $pool ; then
+    local pool_path=$2
+    virsh pool-define-as $pool dir - - - - "$pool_path"
+    virsh pool-build $pool
+    virsh pool-start $pool
+    virsh pool-autostart $pool
+  fi
+}
+
+function cleanup_volume_pool() {
+  local pool=$1
+  if virsh pool-info $pool ; then
+    local pool_path=$(get_volume_pool_path $pool)
+    if [[ -n "${pool_path}" ]]; then
+      for vol in $(virsh vol-list --pool $pool | awk "/${pool}/ {print(\$1)}") ; do
+        virsh vol-delete --pool $pool $vol
+      done
+    fi
+    virsh pool-destroy $pool
+    virsh pool-undefine $pool
+  fi
+}
+
+function create_network() {
+  local network=$1
+  if ! virsh net-info $network ; then
+    local ip=$2
+    local xml_file=${3:-"/tmp/${network}.xml"}
+    cat > $xml_file <<EOF
+<network>
+  <name>${network}</name>
+  <bridge name="${network}" />
+  <forward mode="nat"/>
+  <ip address="${ip}" netmask="255.255.255.0"/>
+</network>
+EOF
+    virsh net-define $xml_file
+    virsh net-autostart $network
+    virsh net-start $network
+    rm -f $xml_file
+  fi
+}
+
+function cleanup_network() {
+  local network=$1
+  if virsh net-info $network ; then
+    virsh net-destroy $network
+    virsh net-undefine $network
+  fi
+}
+
+function create_volume() {
+  local pool=$1
+  local name=$2
+  local size=$3
+  local format=${4:-'qcow2'}
+  if ! virsh vol-info --pool $pool $name ; then 
+    virsh vol-create-as --name $name --capacity $size --format $format --allocation $size --pool $pool
+  fi
+}
+
+function create_vm() {
+  local name=$1
+  local pool=$2
+  local network=$3
+  local cdrom=$4
+  local ram=${5:-16384}
+  local cpu=${6:-4}
+  local os_ver=${7:-'ubuntu16.04'}
+
+  local vol1="${name}-vol-1.qcow2"
+  local vol2="${name}-vol-2.qcow2"
+  create_volume $pool $vol1 '100G'
+  create_volume $pool $vol2 '100G'
+
+  local pool_path=$(get_volume_pool_path $pool)
+
+  virt-install \
+    --name=$name \
+    --ram=$ram \
+    --vcpus=$cpu,cores=$cpu \
+    --os-type=linux \
+    --os-variant=$os_ver \
+    --virt-type=kvm \
+    --disk "${pool_path}/$vol1",cache=writeback,bus=virtio,serial=$(uuidgen) \
+    --disk "${pool_path}/$vol2",cache=writeback,bus=virtio,serial=$(uuidgen) \
+    --cdrom "$cdrom" \
+    --noautoconsole \
+    --network network=$network,model='e1000' \
+    --graphics vnc,listen=0.0.0.0
+
+  if ! virsh dominfo $name &> /dev/null ; then
+    echo "ERROR: Failed to create vm $name"
+    return 1
+  fi
+
+  echo "VNC port: $(get_vnc $name)"
+  echo "VM $name created successfully (VNC port: `get_vnc $name`)"
+}
+
+function wait_vm_status() {
+  local name=$1
+  local status=$2
+  local timeout=${3:-360}
+  local delay=${4:-10}
+  for (( i=0; i < $timeout; ++i )) ; do
+   local cur_stat=$(virsh dominfo $name | awk '/State/ {print $2}')
+   if [[ "$cur_stat" == "$status" ]] ; then
+     return 0
+   fi
+   sleep $delay
+  done
+  (( timeout_s=timeout*delay ))
+  echo "ERROR: Faile to wait status $status during timeout $timeout_s"
+  return 1
+}
+
+
+function mount_image() {
+  local image=$1
+  local guest_device=${2:-''}
+  local mount_point=${3:-''}
+  if [[ -z "${mount_point}" ]] ; then
+    mount_point=$(mktemp -d)
+  fi
+  local dev_opts="-i"
+  if [[ -n "$guest_device" ]] ; then
+    dev_opts="-m $guest_device"
+  fi
+  guestmount -a $image $dev_opts $mount_point
+  echo $mount_point
+}
+
+function unmount_image() {
+  mount_point=$1
+  guestunmount $mount_point
+  rmdir $mount_point
+}
+
+function patch_vm_network_settings {
+  local name=$1
+  local pool_name=$2
+  local iface_ip=$3
+  local gateway_ip=$4
+  local pool_path=$(get_volume_pool_path $pool_name)
+  local image_path="${pool_path}/${name}-vol-1.qcow2"
+  local mount_point=$(mount_image $image_path)
+  local net_mask='255.255.255.0'
+  local network=$(echo $iface_ip | sed 's/\([0-9.]\+\)\(\.[0-9]\+\)$/\1.0/')
+  local broadcast=$(echo $iface_ip | sed 's/\([0-9.]\+\)\(\.[0-9]\+\)$/\1.255/')
+
+  if [[ ! -f ${mount_point}/etc/redhat-release ]] ; then
+    local iface=$(grep -v 'loopback' ${mount_point}/etc/network/interfaces | awk '/iface.*inet/ {print($2)}')
+    echo "INFO: Ubuntu"
+    cat << EOF > ${mount_point}/etc/network/interfaces
+# Patched by ECS deploy scripts
+# The loopback network interface
+auto lo
+iface lo inet loopback
+
+auto ${iface}
+iface ${iface} inet static
+        address $iface_ip
+        netmask $net_mask
+        network $network
+        broadcast $broadcast
+        gateway $gateway_ip
+        dns-nameservers 8.8.8.8
+EOF
+  else
+    echo "INFO: CentOS"
+    cat << EOF > ${mount_point}/etc/sysconfig/network-scripts/ifcfg-${iface}
+DEVICE=${iface}
+TYPE=Ethernet
+ONBOOT=yes
+NM_CONTROLLED=no
+BOOTPROTO=static
+NETWORK=${network}
+NETMASK=${net_mask}
+IPADDR=${iface_ip}
+GATEWAY=${gateway}
+DNS1=8.8.8.8
+EOF
+  fi
+
+  cat << EOF > ${mount_point}/etc/hosts
+127.0.0.1    localhost.localdomain localhost
+${iface_ip}  ${name}               ${name}
+
+::1     ip6-localhost              ip6-loopback
+fe00::0 ip6-localnet
+ff00::0 ip6-mcastprefix
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters
+ff02::3 ip6-allhosts
+EOF
+
+  mkdir -m 644 -p ${mount_point}/root/.ssh
+  cat ~/.ssh/id_rsa.pub >> ${mount_point}/root/.ssh/authorized_keys
+  chmod 644 ${mount_point}/root/.ssh/authorized_keys
+  chown -R root:root ${mount_point}/root/.ssh
+
+  unmount_image $mount_point
+}
+
+function patch_vm_disk_cache_settings {
+  local name=$1
+  local tmp_file="/tmp/${name}.xml"
+  local virsh dumpxml $name > $tmp_file
+  sed "s/cache='writeback'/cache='unsafe'/g" -i $tmp_file
+  virsh define $tmp_file
+  rm -f $tmp_file
+}
+
+function cleanup_env() {
+  local name=$1
+  local network=$2
+  local pool=$3
+  virsh stop $name
+  delete_network $network
+  cleanup_volume_pool $pool
+}
+

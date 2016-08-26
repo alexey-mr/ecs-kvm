@@ -1,0 +1,13 @@
+#!/bin/bash
+
+ECS_ENV='ecs-1'
+
+ECS_NETWORK_NAME="${ECS_ENV}-pub"
+ECS_NETWORK_IP='192.168.180.1'
+
+ECS_VOLUME_POOL_NAME="${ECS_ENV}-pool"
+ECS_VOLUME_POOL_PATH='/var/lib/libvirt/ecs-images'
+
+ECS_CDROM_FILE_NAME="${ECS_ENV}_cdrom.iso"
+ECS_CDROM_PATH="${ECS_VOLUME_POOL_PATH}/${ECS_CDROM_FILE_NAME}"
+
