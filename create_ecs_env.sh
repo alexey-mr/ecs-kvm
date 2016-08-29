@@ -15,10 +15,10 @@ create_volume_pool $ecs_volume_pool $ecs_volume_pool_path
 
 create_vm $ecs_env $ecs_volume_pool $ecs_network $ecs_cdrom_path
 
-wait_vm_status $ecs_env 'shut'
-
 patch_vm_disk_cache_settings $ecs_env
 
 ecs_env_number=$(echo $ecs_env | awk -F '-' '{print($2)')
 ecs_ip=$(echo $ecs_network_ip | sed "s/\\([0-9.]\\+\\)\\(\\.[0-9]\\+\\)\$/\\1.${ecs_env_number}/")
 patch_vm_network_settings $ecs_env $ecs_volume_pool $ecs_ip $ecs_network_ip 
+
+start_vm $ecs_env $ecs_ip

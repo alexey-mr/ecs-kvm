@@ -106,6 +106,8 @@ function create_vm() {
 
   echo "VNC port: $(get_vnc $name)"
   echo "VM $name created successfully (VNC port: `get_vnc $name`)"
+  
+  wait_vm_status $name 'shut'
 }
 
 function wait_vm_status() {
@@ -113,6 +115,7 @@ function wait_vm_status() {
   local status=$2
   local timeout=${3:-360}
   local delay=${4:-10}
+  echo "INFO: wait status $status for vm $name"
   for (( i=0; i < $timeout; ++i )) ; do
    local cur_stat=$(virsh dominfo $name | awk '/State/ {print $2}')
    if [[ "$cur_stat" == "$status" ]] ; then
@@ -121,7 +124,7 @@ function wait_vm_status() {
    sleep $delay
   done
   (( timeout_s=timeout*delay ))
-  echo "ERROR: Faile to wait status $status during timeout $timeout_s"
+  echo "ERROR: Faile to wait status $status during timeout $timeout sec"
   return 1
 }
 
@@ -210,6 +213,8 @@ EOF
   chmod 644 ${mount_point}/root/.ssh/authorized_keys
   chown -R root:root ${mount_point}/root/.ssh
 
+  cat $name > ${mount_point}/etc/hostname
+
   unmount_image $mount_point
 }
 
@@ -231,3 +236,40 @@ function cleanup_env() {
   cleanup_volume_pool $pool
 }
 
+function run_in_vm() {
+  local ip=$1
+  local cmd=$2
+  ssh -ikp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@${ip} "$cmd"
+}
+
+function prepare_vm_env() {
+  local ip=$1
+  run_in_vm $ip "apt-get udpate && apt-get install -y git puppet"
+  run_in_vm $ip "puppet module install puppetlabs-firewall"
+  run_in_vm $ip "puppet module install puppetlabs-stdlib"
+}
+
+function wait_vm_network() {
+  local ip=$1
+  local timeout=${2:-60}
+  local delay=${3:-5}
+  for (( i=0; i < $timeout; ++i )) ; do
+    if ping -c 1 -W 1 $ip > /dev/null 2>&1 ; then
+      if run_in_vm $ip 'ls /' > /dev/null 2>&1 ; then
+        return 0
+      fi
+    fi
+   sleep $delay
+  done
+  (( timeout_s=timeout*delay ))
+  echo "ERROR: Faile to wait vm network $ip during timeout $timeout_s"
+  return 1
+}
+
+function start_and_wait_vm() {
+  local name=$1
+  local ip=$2
+  virsh start $name
+  wait_vm_status $name 'running'
+  wait_vm_network $name $ip
+}
